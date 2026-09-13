@@ -7,6 +7,7 @@ import path from 'path'
 import { compile } from '@term/make/code/compile/compile'
 import type { Roll } from '@term/make/code/compile/roll'
 import { projectDeckOf } from '@term/call/code/deck-of'
+import { projectRoleOf, projectLeanOf } from '@term/call/code/role-of'
 import { renderDiagnostic } from '@term/call/code/report'
 import { mergeRolls, showRoll } from '@term/make/code/compile/roll'
 import { findTreeFiles, projectResolver } from '@term/call/code/make'
@@ -27,6 +28,11 @@ export function projectRoll(root: string): {
   const resolve = projectResolver(root)
   const cache = projectCache(root)
   const deckOf = projectDeckOf()
+  // the role and lean readers, the same ones `term make` compiles with. The roll is a SECOND compile of every
+  // file, so without them a lean grammar that just built clean is read long-form here and every property head
+  // in it is reported as an unknown name, under the "Compiled N files" line (lean-0035, 2026-09-12).
+  const roleOf = projectRoleOf(root)
+  const leanOf = projectLeanOf(root)
   const rolls: Roll[] = []
   const failed: string[] = []
 
@@ -37,7 +43,7 @@ export function projectRoll(root: string): {
       : source
     const result = compile(
       { file, text },
-      { resolve, cache, roll: true, deckOf },
+      { resolve, cache, roll: true, deckOf, roleOf, leanOf },
     )
 
     if (!result.ok) {

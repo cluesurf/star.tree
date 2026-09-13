@@ -14,7 +14,9 @@ load @term/mill/code/code/bind/mine
 load @term/mill/code/code/seed/mine
   find seed
 
+# `mark lean`: opted in to the lean surface. See `mine seed-call-open` in ../seed/mine.tree.
 mine mold
+  mark lean
   mine term, term mold
     mine term
       site name

@@ -5,8 +5,8 @@
 
 import { existsSync, readFileSync, statSync } from 'fs'
 import path from 'path'
-import { parseRoleFile, matchRole } from '@cluesurf/deck.tree'
-import type { RoleConfig } from '@cluesurf/deck.tree'
+import { parseRoleFile, matchRoleRule } from '@cluesurf/deck.tree'
+import type { RoleConfig, RoleRule } from '@cluesurf/deck.tree'
 import { manifestValueOf } from '@term/call/code/manifest-name'
 
 export type RoleOf = (file: string) => string | null
@@ -40,10 +40,33 @@ function packageRootOf(file: string, root: string): string {
 }
 
 export function projectRoleOf(root: string): RoleOf {
+  const ruleOf = projectRuleOf(root)
+
+  return file => ruleOf(file)?.name ?? null
+}
+
+/**
+ * Whether a file's role rule carries `mark lean`: the files it matches are read with the lean surface, where a
+ * bare head is a call and a property head is a named argument. See note/term/lean.md.
+ *
+ * A SECOND FUNCTION over the same cache rather than a widened `RoleOf`, because every existing caller wants
+ * the name and only the mill wants the flag.
+ */
+export function projectLeanOf(root: string): (file: string) => boolean {
+  const ruleOf = projectRuleOf(root)
+
+  return file => ruleOf(file)?.mark.includes('lean') ?? false
+}
+
+/**
+ * The matched RULE for a file, cached per package and per file. Both of the above read it, so a build that asks
+ * for the role and the lean flag reads the role files once, not twice.
+ */
+function projectRuleOf(root: string): (file: string) => RoleRule | null {
   // one role config per PACKAGE, read once. A build touches thousands of files across a handful of packages, so
   // the cache is on the package rather than on the file.
   const byPackage = new Map<string, RoleConfig | undefined>()
-  const byFile = new Map<string, string | null>()
+  const byFile = new Map<string, RoleRule | null>()
 
   return file => {
     const known = byFile.get(file)
@@ -59,14 +82,14 @@ export function projectRoleOf(root: string): RoleOf {
     }
 
     const config = byPackage.get(pkg)
-    const role =
+    const rule =
       config && config.rules.length > 0
-        ? matchRole({ filePath: file, config })
+        ? matchRoleRule({ filePath: file, config })
         : null
 
-    byFile.set(file, role)
+    byFile.set(file, rule)
 
-    return role
+    return rule
   }
 }
 

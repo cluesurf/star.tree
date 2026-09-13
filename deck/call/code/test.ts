@@ -8,6 +8,7 @@ import {
 } from '@term/make/code/tint'
 import { runCommand, projectResolver } from '@term/call/code/make'
 import { runTestFile } from '@term/call/code/test-run'
+import { projectRoleOf, projectLeanOf } from '@term/call/code/role-of'
 
 export async function callTest(input: {
   root: string
@@ -183,6 +184,9 @@ async function runSeedTests(input: {
   // the path nativePrelude derives from each module's RESOLVED file (the `term link` / import location), not a
   // hardcoded base.tree path, exactly as `term boot` runs compiled code.
   const resolve = projectResolver(input.root)
+  // the same role and lean readers `term make` compiles with, so a lean grammar's tests read it lean
+  const roleOf = projectRoleOf(input.root)
+  const leanOf = projectLeanOf(input.root)
   const readRuntime = (p: string): string | undefined =>
     existsSync(p) ? readFileSync(p, 'utf8') : undefined
 
@@ -201,6 +205,8 @@ async function runSeedTests(input: {
         resolve,
         env: 'node',
         readRuntime,
+        roleOf,
+        leanOf,
       })
 
       if (run.failure) {

@@ -127,22 +127,31 @@ function carriesCode(group: GroupNode): boolean {
 
 // ---- the tree, read ----
 
-export function readDataText(source: {
-  file: string
-  text: string
-}): { ok: true; data: DataFile } | { ok: false; diagnostics: Diagnostic[] } {
+export function readDataText(
+  source: {
+    file: string
+    text: string
+  },
+  lean = false,
+): { ok: true; data: DataFile } | { ok: false; diagnostics: Diagnostic[] } {
   const parsed = parse(source)
 
   if (!parsed.ok) {
     return { ok: false, diagnostics: parsed.diagnostics }
   }
 
-  return readData(parsed.tree, source.file)
+  return readData(parsed.tree, source.file, lean)
 }
 
+// `lean`: the file's role carries `mark lean`, and a head the dialect does not know, carrying a value, is a
+// `host` entry keyed by that head. `a 10` is `host a, 10`, `key <tense>` is `host key, <tense>`, and a head over
+// a block is a map entry. `list` stays `list`, so a one-element list is still written `list x / 5` and the count
+// of values never decides what an entry is. The lean form is only ever read under the mark: the content rule
+// (`isDataTree`) does not know it, so an unmarked file full of bare heads is not data. note/term/lean.md.
 export function readData(
   tree: RootNode,
   file: string,
+  lean = false,
 ): { ok: true; data: DataFile } | { ok: false; diagnostics: Diagnostic[] } {
   const diagnostics: Diagnostic[] = []
   const trees = new Map<string, DataTree>()
@@ -160,6 +169,19 @@ export function readData(
     const kind = head ? HEADS.get(head) : undefined
 
     if (!kind) {
+      // the lean surface: the head IS the key, and what follows is the value or the block
+      if (lean && head && group.nodes.length > 1) {
+        seenData = true
+
+        const entry = readEntry(group, 'host', true)
+
+        if (entry) {
+          entries.push(entry)
+        }
+
+        continue
+      }
+
       error(
         spanOf(group),
         `"${head ?? '?'}" is not data. A data file has host, list, mesh, tree and fuse, and nothing else`,
@@ -222,10 +244,11 @@ export function readData(
 
   return { ok: true, data: { root, trees } }
 
-  // `host <key>, <scalar>` / `host <key>` + entries / `list <key>` + items
-  function readEntry(group: GroupNode, kind: string): DataEntry | undefined {
-    const name = keyOf(group)
-    const keyNode = group.nodes[1]
+  // `host <key>, <scalar>` / `host <key>` + entries / `list <key>` + items. Under `asHead` the group's own head
+  // is the key and everything after it is the value, which is the lean spelling: `a 10` for `host a, 10`.
+  function readEntry(group: GroupNode, kind: string, asHead = false): DataEntry | undefined {
+    const name = asHead ? headOf(group) : keyOf(group)
+    const keyNode = asHead ? group.nodes[0] : group.nodes[1]
 
     if (name === undefined) {
       if (kind === 'list') {
@@ -246,7 +269,7 @@ export function readData(
       return undefined
     }
 
-    const rest = group.nodes.slice(2)
+    const rest = group.nodes.slice(asHead ? 1 : 2)
 
     if (kind === 'host') {
       // a bare `true` / `false` / `void` after the comma parses as a group of one name, so it is a scalar, not a block
@@ -298,6 +321,13 @@ export function readData(
       } else if (child.nodes.length === 1 && head) {
         // a bare word where a value belongs: `host env, prod`
         error(spanOf(child), `"${head}" is not a value. Text is written <${head}>`)
+      } else if (lean && head) {
+        // the lean surface, inside a map: the head is the key
+        const entry = readEntry(child, 'host', true)
+
+        if (entry) {
+          out.push(entry)
+        }
       } else {
         error(
           spanOf(child),

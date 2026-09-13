@@ -116,7 +116,19 @@ mine seed-def
 
 # a bare call: the callee is the head itself (`make-vector-4` with seed arguments below). At least one
 # argument, so a lone word stays a word.
+#
+# `mark lean` OPTS THIS RULE IN to the lean surface: in a file whose role carries `mark lean`, an argument that
+# is itself a bare-head call with a plain name is read as a NAMED argument instead, the head becoming the label.
+# See note/term/lean.md.
+#
+# DECLARED HERE RATHER THAN DERIVED. The first design derived the set from "a rule with a `bind` site", and the
+# measurement killed it: thirty `mine` rules have one, and at least seven must never take labels, because `bind`
+# is a CLI default under `mine take`, a loop bound under `mine walk`, a route under `mine hook`. Requiring a
+# `seed` site alongside does not rescue it either, since `mine mold` has no `seed` site and is one of the places
+# lean most needs to fire. So a rule opts in by name, which is also what makes the decision reviewable when
+# somebody adds a `bind` site to a new rule.
 mine seed-call-open
+  mark lean
   mine open
     site name
     mine any

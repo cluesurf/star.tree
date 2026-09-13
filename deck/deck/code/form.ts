@@ -42,6 +42,10 @@ export type DeckHostGroup = {
 
 export type RoleRule = {
   name: string
+  // `mark <name>` flags on the rule: how the files it matches are READ, rather than which mill reads them.
+  // `lean` is the only one today (note/term/lean.md). A list of words rather than one field per flag, so a
+  // second setting needs no change here and no change to the grammar.
+  mark: string[]
   take: {
     pattern: string
     miss: string[]

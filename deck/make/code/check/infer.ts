@@ -72,6 +72,11 @@ export function check(
   const exceptionProps = new Map<string, string | undefined>()
   // the fields every exception carries, bound in a `case <form>` arm beside the form's own props
   const EXCEPTION_SHARED = ['host', 'form', 'note', 'code', 'time']
+  // how many loops enclose the statement being checked. `halt` (break) and `turn next` (continue) are LOOP-ONLY
+  // statements, and outside a loop every backend emits a keyword its own parser refuses, so the failure arrives as
+  // a syntax error in generated code pointing nowhere near the source. A nested `task` resets it, because a loop
+  // outside the closure does not enclose the closure's body.
+  let loopDepth = 0
   // a caught exception's raise set (the guarded body's), for the exhaustiveness of a `fork case` over it
   const caughtRaises = new Map<string, Set<string>>()
   let programRaises: Map<string, Set<string>> | undefined
@@ -92,6 +97,12 @@ export function check(
   const variantOwners = new Map<string, string[]>()
   // each variant's own fields, exposed inside a matching `case` branch (so `self/value` works after a match)
   const variantFields = new Map<string, Map<string, Type>>()
+  // THE SAME FIELDS, ONE ENTRY PER DECLARING ENUM, because `variantFields` is keyed on the variant's surface
+  // name alone and the last enum to declare it wins. That is fine for a match arm, where the kernel has
+  // already settled which enum it is, and it is not fine for the LEAN unwrap: a `not` declared by both
+  // `pattern` and `condition` resolved to whichever came second, its field name did not match, and the
+  // property head stayed an array all the way to the kernel (v4 Sanskrit, 2026-09-12).
+  const variantFieldsByOwner = new Map<string, Map<string, Type>[]>()
   // a form's generic parameter names, e.g. maybe -> ["t"], for parameterized named types (maybe<t>)
   const formGenerics = new Map<string, string[]>()
 
@@ -155,6 +166,10 @@ export function check(
           }
 
           variantFields.set(variant.name, own)
+          variantFieldsByOwner.set(variant.name, [
+            ...(variantFieldsByOwner.get(variant.name) ?? []),
+            own,
+          ])
         }
 
         enums.set(statement.name, set)
@@ -625,6 +640,12 @@ export function check(
       }
 
       case 'record': {
+        // THE LEAN UNWRAP RUNS FIRST, before the overloaded-variant escape below. A property head builds an
+        // array whatever the construction turns out to be, so a variant whose name two enums share (`not` on
+        // both `pattern` and `condition`) would otherwise hand the kernel `Array pattern` where one pattern
+        // was declared, and the kernel reports a type mismatch rather than the unwrap that was meant.
+        unwrapLeanFields(node, env)
+
         // an OVERLOADED variant constructor (a surface name shared by more than one enum) cannot be typed to a single
         // enum here. Infer its field values for their own sake, then leave the construction's type flexible so it
         // unifies with whatever the position expects; the kernel resolves the owning enum and verifies the fields.
@@ -665,6 +686,19 @@ export function check(
               seedType(fieldType, argMap),
               field.value.span,
               'field value',
+            )
+          } else if (declared && declared.size > 0) {
+            // A FIELD THE FORM DOES NOT DECLARE. It used to be accepted in silence and emitted, which is how
+            // `position some value 3, description <x>` shipped `{ form: "some", value: 3, description: ["x"] }`:
+            // the comma popped one level, left the inline `some` open, and the next property landed inside it.
+            // A construction knows its own fields, so this is decidable here wherever it is written.
+            diagnostics.push(
+              diagnose('unknown-name', {
+                file: currentFile,
+                span: field.value.span,
+                message: `"${node.name}" has no field "${field.name}"`,
+                hint: `its fields are ${[...declared.keys()].join(', ')}. An inline construction stays open after a comma, so a property meant for the enclosing form has to start its own line`,
+              }),
             )
           }
         }
@@ -861,9 +895,16 @@ export function check(
         if (
           node.callee.form === 'variable' &&
           !env.has(node.callee.name) &&
-          (node.names || functions.has(node.callee.name))
+          (node.names || node.lean || functions.has(node.callee.name))
         ) {
-          arrangeArguments(node)
+          arrangeArguments(node, env)
+
+          // THE LEAN SURFACE: a bare head that named a FORM was rewritten in place into a record construction.
+          // The node is no longer a call, so it is typed as what it became and this case is done with it.
+          if ((node as Expression).form === 'record') {
+            type = inferExpression(node, env)
+            break
+          }
         }
 
         // same-arity overloads: pick the one whose parameter types fit the arguments
@@ -1141,7 +1182,13 @@ export function check(
         node.params.forEach((p, i) =>
           inner.set(p.name, { vars: [], type: params[i]! }),
         )
+
+        // a closure is its own control-flow scope, exactly as a nested task is: a `walk` around the literal does
+        // not make `turn next` legal inside it, and every backend lowers the body to a separate function
+        const outerLoops = loopDepth
+        loopDepth = 0
         checkBody(node.body, inner, node.result ?? UNKNOWN)
+        loopDepth = outerLoops
 
         const fn: Type = {
           kind: 'function',
@@ -1242,7 +1289,9 @@ export function check(
           node.cond.span,
           'loop condition',
         )
+        loopDepth += 1
         checkBody(node.body, env, result)
+        loopDepth -= 1
         break
       case 'if':
         for (const branch of node.branches) {
@@ -1294,7 +1343,9 @@ export function check(
 
         const inner = new Map(env)
         inner.set(node.item, { vars: [], type: element })
+        loopDepth += 1
         checkBody(node.body, inner, result)
+        loopDepth -= 1
         break
       }
 
@@ -1437,6 +1488,10 @@ export function check(
                   }" does not cover: ${missing.join(', ')}`,
                 }),
               )
+            } else {
+              // every variant is covered and there is no `otherwise`, so the chain a backend emits may close
+              // with an `else`. See `closed` in compile/node.ts.
+              node.closed = true
             }
           }
         }
@@ -1532,34 +1587,345 @@ export function check(
         break
       case 'break':
       case 'continue':
+        // OUTSIDE A LOOP this is not a style question, it is un-emittable: TypeScript answers
+        // `Cannot use "continue" here`, and Rust, Swift and Kotlin each refuse it in their own words, so the
+        // message arrives in the wrong language pointing at generated code. `turn next` was written once in a
+        // `case none` arm to mean "fall through to the rest of the task", which is a reading the surface does
+        // not have.
+        if (loopDepth === 0) {
+          const word = node.form === 'break' ? 'halt' : 'turn next'
+
+          diagnostics.push(
+            diagnose('unexpected-node', {
+              file: currentFile,
+              span: node.span,
+              message: `\`${word}\` is only valid inside a loop`,
+              hint:
+                node.form === 'break'
+                  ? 'to leave a task, use `send back`; bare `halt` leaves the innermost `walk`'
+                  : 'to skip the rest of a branch, restructure it as a `fork`; `turn next` starts the next turn of the innermost `walk`',
+            }),
+          )
+        }
+
+        break
       case 'record-type':
       case 'mask':
       case 'instance':
       case 'native':
         break
-      case 'function':
+      case 'function': {
+        // a nested task is its own control-flow scope: an enclosing `walk` does not reach into it
+        const outer = loopDepth
+        loopDepth = 0
         checkFunction(node)
+        loopDepth = outer
         break
+      }
     }
+  }
+
+  // THE LEAN SURFACE: a field that came from a property head is an array of that head's children. Where the
+  // declared field is not a list, a one-item array is that item and more than one is a diagnostic. By the
+  // DECLARED TYPE and never by the count, so a one-element list and a scalar stay different things.
+  function unwrapLeanFields(
+    node: Extract<Expression, { form: 'record' }>,
+    env?: Env,
+  ): void {
+    if (!node.lean) {
+      return
+    }
+
+    // every declaration of this variant, not just the last one read: `variantFields` is keyed on the surface
+    // name alone, so a case two enums declare resolves there to whichever was read second. Where both declare
+    // the field, they have to agree about being a list for the unwrap to be safe; where they disagree, or
+    // where neither declares the name, it is left to the kernel.
+    const candidates = variantEnum.has(node.name)
+      ? (variantFieldsByOwner.get(node.name) ?? [])
+      : records.has(node.name)
+        ? [records.get(node.name)!]
+        : []
+
+    // A PROPERTY HEAD GIVEN TWICE. `one <a>` and `one <c>` under the same construction emitted
+    // `{ one: "a", two: "b", one: "c" }`: the second silently wins and the first is gone, which cost two
+    // wrong tables in the Sanskrit port and was caught only by a parity test against another implementation.
+    // A named argument given twice is either a mistake or a list, so the surface says which: a LIST field
+    // accumulates (the same rule the single-head unwrap uses, by the DECLARED type and never by the count),
+    // and anything else is refused.
+    {
+      const byName = new Map<string, number[]>()
+
+      node.fields.forEach((field, index) => {
+        const at = byName.get(field.name)
+        at ? at.push(index) : byName.set(field.name, [index])
+      })
+
+      const drop = new Set<number>()
+
+      for (const [name, at] of byName) {
+        if (at.length < 2) {
+          continue
+        }
+
+        const declared = candidates
+          .map(one => one.get(name))
+          .filter((one): one is Type => one !== undefined)
+
+        const listed =
+          declared.length > 0 &&
+          declared.every(
+            one => resolve(seedType(one, new Map())).kind === 'array',
+          )
+
+        const every = at.map(i => node.fields[i]!)
+
+        if (listed && every.every(f => f.value.form === 'array')) {
+          const first = every[0]!.value as Extract<
+            Expression,
+            { form: 'array' }
+          >
+
+          for (const later of every.slice(1)) {
+            first.items.push(
+              ...(later.value as Extract<Expression, { form: 'array' }>).items,
+            )
+          }
+
+          at.slice(1).forEach(i => drop.add(i))
+          continue
+        }
+
+        diagnostics.push(
+          diagnose('type-mismatch', {
+            file: currentFile,
+            span: every[1]!.value.span,
+            message: `"${name}" of "${node.name}" is given twice, and it is not a list, so the second would silently replace the first`,
+            hint: 'give it once, or declare the field `like list` so the heads accumulate',
+          }),
+        )
+
+        at.slice(1).forEach(i => drop.add(i))
+      }
+
+      if (drop.size > 0) {
+        node.fields = node.fields.filter((_, i) => !drop.has(i))
+      }
+    }
+
+    for (const field of node.fields) {
+      const seen = candidates
+        .map(one => one.get(field.name))
+        .filter((one): one is Type => one !== undefined)
+
+      const fieldType = seen[0]
+
+      if (field.value.form !== 'array' || !fieldType) {
+        continue
+      }
+
+      const listed = seen.map(
+        one => resolve(seedType(one, new Map())).kind === 'array',
+      )
+
+      if (listed.some(Boolean) && listed.some(one => !one)) {
+        continue
+      }
+
+      if (listed[0]) {
+        // a list field, whose one child is itself a list, takes that list directly. See arrangeArguments
+        if (
+          field.value.items.length === 1 &&
+          resolve(inferExpression(field.value.items[0]!, env)).kind === 'array'
+        ) {
+          field.value = field.value.items[0]!
+        }
+
+        continue
+      }
+
+      if (field.value.items.length === 1) {
+        field.value = field.value.items[0]!
+      } else if (field.value.items.length > 1) {
+        diagnostics.push(
+          diagnose('type-mismatch', {
+            file: currentFile,
+            span: field.value.span,
+            message: `"${field.name}" of "${node.name}" takes one value, and this gives ${field.value.items.length}`,
+          }),
+        )
+      }
+    }
+
+    delete node.lean
   }
 
   // put a call's arguments in the callee's declared order and fill its defaults. See the `call` case.
   function arrangeArguments(
     node: Extract<Expression, { form: 'call' }>,
+    // the scope, so a lean property's one child can be typed to tell a list VALUE from a one-item list
+    env?: Env,
   ): void {
     const callee = (node.callee as { name: string }).name
     const signature = functions.get(callee)
 
+    // THE LEAN SURFACE, where a bare head that names a FORM rather than a task is a construction of that form,
+    // with the labels as its fields. Rewritten in place into a `record` node, which the record case then types
+    // exactly as a `make` would. Only under lean: outside it a call to a form's name is the unknown-callee
+    // diagnostic it always was. note/term/lean.md, "position first, then the name".
+    // A FORM or a VARIANT: `point a 10, b 20` builds a point, and `feature feature <case>, value <nominative>`
+    // builds the `feature` case of whichever sum declares it, typed as that sum by the record case exactly as
+    // `make feature` would be. A variant shared by several sums is left to the kernel there, the same as `make`.
+    if (!signature && node.lean && (records.has(callee) || variantEnum.has(callee))) {
+      const names = node.names ?? node.args.map(() => undefined)
+      const fields: { name: string; value: Expression }[] = []
+      const positional: Expression[] = []
+
+      node.args.forEach((arg, i) => {
+        const name = names[i]
+
+        if (name === undefined || name === null) {
+          positional.push(arg)
+        } else {
+          fields.push({ name, value: arg })
+        }
+      })
+
+      // A lean construction names every field by its head, so a value with no head has nowhere to go. It is
+      // refused here rather than handed to the slot filler, which runs BEFORE the checker and so never sees a
+      // node that was still a call at the time; handed on, four values into a two-field form emitted garbage
+      // with no message on 2026-09-12. The usual cause is an inline property whose value is not a literal
+      // (`point a, read p/b`), which the comma rule splits: that property has to head its own line.
+      if (positional.length > 0) {
+        diagnostics.push(
+          diagnose('type-mismatch', {
+            file: currentFile,
+            span: positional[0]!.span,
+            message: `"${callee}" is a form, so every value here needs a field name as its head. A property whose value is a read, a call or a list must start its own line, because an inline comma pops out of it`,
+          }),
+        )
+      }
+
+      const record = node as unknown as Record<string, unknown>
+
+      delete record.callee
+      delete record.args
+      delete record.names
+      delete record.leanNames
+      delete record.lean
+      record.form = 'record'
+      record.name = callee
+      record.fields = fields
+      record.lean = true
+
+      return
+    }
+
     // a receiver-dispatched method or an unknown callee: the labels are documentation and the call stays
-    // positional, as it always was
+    // positional, as it always was. UNDER LEAN a label with nothing to bind to is refused instead: dropping it
+    // would turn `f / key <x> / name <y>` into `f(["x"], ["y"])` in written order, with no message, which is the
+    // one way the lean surface could fail quietly. A label-free lean call (every method call is one) has nothing
+    // to lose and goes through untouched.
     if (!signature) {
+      // only a label that came from a PROPERTY HEAD is refused. An explicit `bind` on a receiver-dispatched
+      // method is documentation, as it always was, and the stdlib writes `call push / bind list, ... / bind
+      // item, ...` everywhere.
+      if (node.lean && node.leanNames?.some(Boolean)) {
+        const dropped = (node.names ?? []).filter((name, i) => name && node.leanNames?.[i])
+
+        diagnostics.push(
+          diagnose('type-mismatch', {
+            file: currentFile,
+            span: node.span,
+            message: `"${callee}" is not a task or a form this file can see, so its properties (${dropped.join(', ')}) name nothing`,
+          }),
+        )
+      }
+
       delete node.names
+      delete node.leanNames
+      delete node.lean
 
       return
     }
 
     const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
     const names = node.names ?? node.args.map(() => undefined)
+
+    // THE LEAN SURFACE, two adjustments before the arguments are placed, both by the DECLARED type and never by
+    // the count. A property built its children as an array; where the parameter is not a list, a one-item array
+    // is that item, and more than one item is a diagnostic. A positional bare word that names an unfilled
+    // boolean parameter is that parameter set to true, which is what makes `strict` under a call a flag.
+    if (node.lean) {
+      const seen = new Set<string>()
+
+      for (let i = 0; i < node.args.length; i++) {
+        const name = names[i]
+        const arg = node.args[i]!
+
+        if (name === undefined || name === null) {
+          if (
+            arg.form === 'variable' &&
+            signature.names.includes(arg.name) &&
+            !seen.has(arg.name) &&
+            resolve(signature.params[signature.names.indexOf(arg.name)] ?? UNKNOWN).kind === 'boolean'
+          ) {
+            names[i] = arg.name
+            node.args[i] = { form: 'boolean', value: true, span: arg.span }
+            seen.add(arg.name)
+          } else if (arg.form === 'variable' && !arg.binding) {
+            // the resolver left this word alone in case it was a flag, and it is not one: the unknown-name
+            // diagnostic it would have given, given here instead, so no spelling goes unreported
+            diagnostics.push(
+              diagnose('unknown-name', {
+                file: currentFile,
+                span: arg.span,
+                message: `the name "${arg.name}" is not defined, and "${callee}" has no boolean parameter of that name for it to be a flag of`,
+              }),
+            )
+          }
+
+          continue
+        }
+
+        seen.add(name)
+
+        const index = signature.names.indexOf(name)
+
+        if (index < 0 || arg.form !== 'array') {
+          continue
+        }
+
+        const param = resolve(signature.params[index] ?? UNKNOWN)
+
+        if (param.kind === 'array') {
+          // A LIST PARAMETER TAKES THE CHILDREN AS ITS ITEMS (`states <a>, <b>`), except when the one child is
+          // itself a list (`states, read xs` or `states / call extra-states`), which fills the parameter
+          // directly. The child's own type is what tells the two apart, and a one-element list of lists is
+          // the one shape this cannot express, which is what `make list` is still for.
+          if (arg.items.length === 1 && env && resolve(inferExpression(arg.items[0]!, env)).kind === 'array') {
+            node.args[i] = arg.items[0]!
+          }
+
+          continue
+        }
+
+        if (arg.items.length === 1) {
+          node.args[i] = arg.items[0]!
+        } else if (arg.items.length > 1) {
+          diagnostics.push(
+            diagnose('type-mismatch', {
+              file: currentFile,
+              span: arg.span,
+              message: `"${name}" of "${callee}" takes one value, and this gives ${arg.items.length}`,
+            }),
+          )
+        }
+      }
+
+      node.names = names
+      delete node.leanNames
+      delete node.lean
+    }
     const ordered: (Expression | undefined)[] = signature.params.map(
       () => undefined,
     )

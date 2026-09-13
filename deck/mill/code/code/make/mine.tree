@@ -16,7 +16,10 @@ load @term/mill/code/code/seed/mine
 
 # `make <form>` with `bind` children. The name is OPTIONAL because the reader's value case for a `make` head
 # fires whether or not one followed: a bare `make` is a record with an empty name.
+# `mark lean`: opted in to the lean surface, so `make x / foo true / bar <baz>` fills the fields `foo` and
+# `bar`. See `mine seed-call-open` in ../seed/mine.tree.
 mine make
+  mark lean
   mine term, term make
     mine maybe
       mine term

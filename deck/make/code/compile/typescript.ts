@@ -223,6 +223,52 @@ export function tsEmptyOf(type: Type | undefined): string {
   }
 }
 
+// The declared fields of one VARIANT, resolved through the enum the construction was typed as. A variant name
+// alone is ambiguous (two sums may each declare a case called `any`), so an overloaded name with no resolved
+// type fills NOTHING rather than guessing: an under-filled literal is a type error a reader can act on, and a
+// wrongly-filled one is a literal that silently stops matching its own type.
+function variantCase(
+  name: string,
+  type: Type | undefined,
+): { name: string; type: Type; optional?: boolean }[] {
+  const owner = type?.kind === 'named' ? type.name : undefined
+  const byOwner = owner ? tsVariantFieldsByOwner.get(owner) : undefined
+  const own = byOwner?.get(name)
+
+  if (own) {
+    return own
+  }
+
+  let owners = 0
+
+  for (const sum of tsVariantFieldsByOwner.values()) {
+    if (sum.has(name)) {
+      owners += 1
+    }
+  }
+
+  return owners === 1 ? (tsVariantFields.get(name) ?? []) : []
+}
+
+// The fields a construction left out, each set to its type's empty value, so the object literal satisfies the
+// interface (or the variant case) it is written for. A struct has done this since the native backends needed
+// it; a VARIANT did not, which is the disagreement between a construction and its own type that lean-0044
+// names. `need false` fields are optional in the emitted type and so need no filling.
+function emptyFor(
+  declared: { name: string; type: Type; optional?: boolean }[],
+  given: { name: string }[],
+): string[] {
+  if (declared.length === 0) {
+    return []
+  }
+
+  const names = new Set(given.map(f => f.name))
+
+  return declared
+    .filter(f => !names.has(f.name) && !f.optional)
+    .map(f => `${toMember(f.name)}: ${tsEmptyOf(f.type)}`)
+}
+
 export function toPascal(name: string): string {
   const camel = toCamel(name)
   const spelled = camel.charAt(0).toUpperCase() + camel.slice(1)
@@ -241,7 +287,20 @@ let tsExceptions = new Set<string>()
 // each variant's declared field names, in order, so a match arm can bind them as locals: `case circle` puts
 // `radius` in scope (the resolver already declares it), and `link r` renames the first field to `r`. Without this
 // the arm read a bare identifier nothing had declared and the program died at run time. Set by emitTypeScript.
-let tsVariantFields = new Map<string, string[]>()
+let tsVariantFields = new Map<
+  string,
+  { name: string; type: Type; optional?: boolean }[]
+>()
+
+// the same, keyed by the enum that declares the case. A variant NAME is not unique in a program: `any`, `not`,
+// `position` and `boundary` are each declared by both `Pattern` and `Condition` in the v4 Sanskrit grammar, and
+// the flat map above holds whichever was read last. Filling a construction's left-out fields has to use the
+// enum the construction is TYPED as, or it fills the other sum's fields and the literal stops matching its own
+// type. Owner -> variant -> fields.
+let tsVariantFieldsByOwner = new Map<
+  string,
+  Map<string, { name: string; type: Type; optional?: boolean }[]>
+>()
 
 // the fields of every struct form in the program, for the `fill` / `melt` spec: name, type, `need false`
 let tsRecordFields = new Map<string, { name: string; type: Type; optional?: boolean }[]>()
@@ -455,6 +514,29 @@ function tsType(type: Type | undefined): string {
       // carries one emits `any` rather than a `Type` no module defines
       if (type.name === 'type') {
         return 'any'
+      }
+
+      // THE FOUR KEYWORD PRIMITIVES, by their Term names. A milled annotation keeps `like text` as the NAMED
+      // type `text` (the checker seeds it to a fresh variable and unifies it with the literal, so it never
+      // rewrites the node), and a backend that Pascal-cases it emits a `Text` no module defines. These four
+      // and no others: they are exactly the names the mill itself synthesizes for a `host` with no `like`
+      // (mint-bridge, "the constant's type is the one its LITERAL names"), plus `like text`. A form the
+      // program declares is still its own type, so a local `form text` would win.
+      if (
+        !tsRecordFields.has(type.name) &&
+        !tsVariantFieldsByOwner.has(type.name)
+      ) {
+        if (type.name === 'text') {
+          return 'string'
+        }
+
+        if (type.name === 'boolean') {
+          return 'boolean'
+        }
+
+        if (type.name === 'number' || type.name === 'integer') {
+          return 'number'
+        }
       }
 
       // type arguments when the reference carries them, so `like maybe / head
@@ -734,10 +816,21 @@ function makeEmitter(
           .join(', ')})`
       }
 
-      case 'array':
-        return `[${node.items
-          .map(item => expression(item))
-          .join(', ')}]`
+      case 'array': {
+        // AN EMPTY LIST SPELLS ITS ELEMENT, for the reason the empty map below spells its key and value:
+        // `const out = []` is `never[]` to TypeScript, so the first `push` onto it is an error under
+        // `strict` and every `out` after it is the wrong type. A filled literal infers from its items.
+        const ann =
+          node.items.length === 0 && node.type?.kind === 'array'
+            ? `: ${tsType(node.type.element)}[]`
+            : ''
+
+        // the annotation belongs on the BINDING, and an expression has none to put it on, so an empty list
+        // in expression position is cast instead: both say the same thing to the checker.
+        return ann === ''
+          ? `[${node.items.map(item => expression(item)).join(', ')}]`
+          : `[] as ${tsType(node.type!.kind === 'array' ? node.type.element : node.type!)}[]`
+      }
       case 'map': {
         // an EMPTY map spells its checked key/value (`new Map<T, boolean>()`), so a construction flowing into a
         // typed field or parameter is assignable (Map's type arguments are invariant); a filled one infers
@@ -771,23 +864,26 @@ function makeEmitter(
           return 'undefined'
         }
 
-        // an enum variant carries a discriminant tag; a struct is a plain object
+        // an enum variant carries a discriminant tag; a struct is a plain object. A variant fills what it leaves
+        // out for the same reason a struct does, and until 2026-09-13 it did not: `reference <x>` emitted
+        // `{ form: "reference", element: "x" }` while the emitted variant TYPE requires every field of the case,
+        // so the construction and its own type disagreed and nothing noticed, because a literal with no
+        // contextual type is never checked against the type it is meant to be. 636 of the v4 grammar's strict
+        // errors were one such pattern built without its optional `system`.
         if (variants.has(node.name)) {
           return `{ ${[
             'form: ' + JSON.stringify(node.name),
             ...fields,
+            ...emptyFor(variantCase(node.name, node.type), node.fields),
           ].join(', ')} }`
         }
 
         // a field the construction leaves out (`need false`, or one the runtime fills on another path) takes its
         // type's empty value, so the object satisfies its interface -- the rule the native backends already follow
-        const declaredFields = tsRecordFields.get(node.name) ?? []
-        const givenNames = new Set(node.fields.map(f => f.name))
-        const missing = declaredFields
-          .filter(f => !givenNames.has(f.name) && !f.optional)
-          .map(f => `${toMember(f.name)}: ${tsEmptyOf(f.type)}`)
-
-        return `{ ${[...fields, ...missing].join(', ')} }`
+        return `{ ${[
+          ...fields,
+          ...emptyFor(tsRecordFields.get(node.name) ?? [], node.fields),
+        ].join(', ')} }`
       }
 
       case 'member':
@@ -1132,7 +1228,14 @@ function makeEmitter(
 
         const keyword = assignedNames.has(node.name) ? 'let' : 'const'
 
-        return `${keyword} ${toCamel(node.name)} = ${expression(
+        // A DECLARED TYPE IS SPELLED ON THE BINDING. An object literal with no contextual type is inferred
+        // WIDENED -- `{ form: "some", value: 200 }` infers `{ form: string; value: number }`, which does not
+        // match `Maybe<number>` -- and a `host x / like list / like feature-state` with a hundred entries
+        // then fails at whatever reads it rather than where it is written. Only when the source declared one:
+        // an inferred binding is left to inference, as it was.
+        const declared = node.type ? `: ${tsType(node.type)}` : ''
+
+        return `${keyword} ${toCamel(node.name)}${declared} = ${expression(
           node.init,
         )}`
       }
@@ -1206,16 +1309,26 @@ function makeEmitter(
           return out
         }
 
-        // `.form` binds tighter than any operator, so a compound
-        // subject (`listSize(x) > 0`) must be parenthesized or the
-        // member access attaches to its last operand. Simple
-        // identifiers / calls / member chains stay bare to keep the
-        // output readable.
-        const subject = /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*|\((?:[^()]|\([^()]*\))*\))*$/.test(
-          raw,
-        )
-          ? raw
-          : `(${raw})`
+        // THE SUBJECT IS EVALUATED ONCE, and a subject that is not already a NAME is bound to one first.
+        //
+        // The chain below reads the subject in every arm's test and again in every field local, so a call
+        // subject ran once per arm: `fork case / list-find one/override ...` called `listFind` three times
+        // for every block of every root, which is wrong if the callee has an effect and wasteful when it
+        // does not. It also cost the emitted TypeScript its narrowing, because `f(x).form === "some"` tells
+        // the checker nothing about the NEXT `f(x)`, so reading `.value` in the arm was an error under
+        // `strict` (mesh's v4 grammar, 2026-09-12).
+        //
+        // A bare identifier or a plain member chain is left alone: it is already a name, re-reading it is
+        // free, and the output stays readable.
+        const isName = /^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)*$/.test(raw)
+        const held = isName ? undefined : `__at${depth}`
+        const subject = held ?? raw
+
+        // the chain, wrapped in a block that holds the subject where one was bound
+        const wrap = (chain: string): string =>
+          held === undefined
+            ? chain
+            : `{\n${pad(depth + 1)}const ${held} = ${raw}\n${pad(depth + 1)}${chain}\n${pad(depth)}}`
 
         // Booleans lower to NATIVE JS booleans in this backend (a
         // comparison emits `>`, an `if` tests truthiness), so a
@@ -1252,7 +1365,7 @@ function makeEmitter(
             out += ` else ${block(node.otherwise, depth)}`
           }
 
-          return out
+          return wrap(out)
         }
 
         // A match on an enum tests the `.form` discriminant. A match on
@@ -1281,14 +1394,16 @@ function makeEmitter(
             out += ` else ${block(node.otherwise, depth)}`
           }
 
-          return out
+          return wrap(out)
         }
 
         let out = ''
         node.cases.forEach((branch, i) => {
           // the variant's fields, as locals: `link` renames them in order, otherwise they keep their names. Only the
           // ones the body reads, so an unused field costs nothing and cannot shadow an outer name by accident.
-          const fields = tsVariantFields.get(branch.label) ?? []
+          const fields = (tsVariantFields.get(branch.label) ?? []).map(
+            f => f.name,
+          )
           const bodyText = branch.body
             .map(s => statement(s, depth + 1))
             .join('\n')
@@ -1308,18 +1423,24 @@ function makeEmitter(
                   .map(s => `${pad(depth + 1)}${guardStart(statement(s, depth + 1))}`)
                   .join('\n')}\n${pad(depth)}}`
 
-          out += `${
-            i ? ' else ' : ''
-          }if (${subject}.form === ${JSON.stringify(
-            branch.label,
-          )}) ${body}`
+          // THE LAST ARM OF AN EXHAUSTIVE MATCH IS A PLAIN `else`, the way the boolean case above closes.
+          // The checker sets `closed` when the arms cover every variant and there is no `otherwise`, and
+          // without it a task whose arms all return reads to TypeScript as one that can fall out of the
+          // bottom: 43 such functions in one grammar, each an error under `strict` (2026-09-12).
+          const last = node.closed && !node.otherwise && i === node.cases.length - 1 && i > 0
+
+          out += last
+            ? ` else ${body}`
+            : `${i ? ' else ' : ''}if (${subject}.form === ${JSON.stringify(
+                branch.label,
+              )}) ${body}`
         })
 
         if (node.otherwise) {
           out += ` else ${block(node.otherwise, depth)}`
         }
 
-        return out
+        return wrap(out)
       }
 
       case 'break':
@@ -1361,8 +1482,13 @@ function makeEmitter(
         // an enum becomes a discriminated union; a struct becomes an interface
         if (node.variants.length > 0) {
           const members = node.variants.map(v => {
+            // `link x, like t, need false` makes a field OPTIONAL, and the emitted type has to say so or the
+            // construction and its own type disagree: `element` takes its `pattern` `need false` and passed the
+            // optional parameter into a field the case declared required, in every module the builder is
+            // inlined into. The mill has carried `optional` since `need false` existed; this backend ignored it.
             const fields = v.fields.map(
-              f => `${toMember(f.name)}: ${tsType(f.type)}`,
+              f =>
+                `${toMember(f.name)}${f.optional ? '?' : ''}: ${tsType(f.type)}`,
             )
 
             return `{ ${[
@@ -1379,7 +1505,7 @@ function makeEmitter(
         const fields = node.fields
           .map(
             f =>
-              `${pad(depth + 1)}${toMember(f.name)}: ${tsType(f.type)}`,
+              `${pad(depth + 1)}${toMember(f.name)}${f.optional ? '?' : ''}: ${tsType(f.type)}`,
           )
           .join('\n')
 
@@ -1524,7 +1650,11 @@ export function emitTypeScript(
   const variants = new Set<string>(options?.variants)
   tsExceptions = new Set<string>(options?.exceptions)
 
-  tsVariantFields = new Map<string, string[]>()
+  tsVariantFields = new Map<
+    string,
+    { name: string; type: Type; optional?: boolean }[]
+  >()
+  tsVariantFieldsByOwner = new Map()
   tsRecordFields = new Map()
   tsFormWalkUsed = false
 
@@ -1534,12 +1664,19 @@ export function emitTypeScript(
         tsRecordFields.set(node.name, node.fields)
       }
 
+      const own = new Map<
+        string,
+        { name: string; type: Type; optional?: boolean }[]
+      >()
+
       for (const v of node.variants) {
         variants.add(v.name)
-        tsVariantFields.set(
-          v.name,
-          v.fields.map(f => f.name),
-        )
+        tsVariantFields.set(v.name, v.fields)
+        own.set(v.name, v.fields)
+      }
+
+      if (own.size > 0) {
+        tsVariantFieldsByOwner.set(node.name, own)
       }
 
       if (node.chain?.includes('exception')) {

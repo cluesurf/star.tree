@@ -38,6 +38,10 @@ export function mill(
   tree: RootNode,
   file: string,
   role?: string,
+  // `mark lean` on the file's role rule: a bare head is a call and a property head is a named argument. The
+  // lean pass runs over the MATCH, between mine and mint, so nothing downstream of it can tell the two
+  // spellings apart. See note/term/lean.md.
+  lean?: boolean,
 ): MillResult {
-  return millByGrammar(tree, file, role)
+  return millByGrammar(tree, file, role, undefined, lean)
 }

@@ -336,6 +336,9 @@ export function parseRoleMill(input: {
   for (const role of matches(mined.match.get('role'))) {
     rules.push({
       name: word(first(role.get('name'))) ?? '',
+      mark: matches(role.get('mark'))
+        .map(entry => word(first(entry.get('name'))) ?? '')
+        .filter(Boolean),
       take: matches(role.get('take')).map(entry => ({
         pattern: input.expand(glob(word(first(entry.get('glob'))) ?? ''), input.root),
         miss: matches(entry.get('miss')).map(m =>

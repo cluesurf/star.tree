@@ -155,6 +155,9 @@ export function compileSeparate(
     // tell a CLI `hook` from a route one (`role call` vs `role site`), so a unit compiled here must be asked the
     // same question a unit compiled through compile() is, or the two paths disagree about what a file means.
     roleOf?: (file: string) => string | null | undefined
+    // `mark lean` on the unit's role rule, same contract as compile()'s `leanOf`. Asked here for the same reason
+    // roleOf is: a unit compiled separately must read the way one compiled through the merged path reads.
+    leanOf?: (file: string) => boolean | undefined
   },
 ): SeparateResult {
   // one parse per module, shared by the dependency walk and the edge graph
@@ -281,6 +284,7 @@ export function compileSeparate(
           expandTemplates(parsed.tree, templates),
           unit.file,
           options.roleOf?.(unit.file) ?? undefined,
+          options.leanOf?.(unit.file) ?? false,
         )
 
         if (!milled.ok) {

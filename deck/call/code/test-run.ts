@@ -17,6 +17,7 @@ import type { NativeEnv } from '@term/make/code/compile/native'
 import { render } from '@term/make/code/parser/diagnostic'
 import { toCamel } from '@term/make/code/compile/typescript'
 import type { Resolver } from '@term/make/code/compile/load'
+import type { RoleOf } from '@term/call/code/role-of'
 import { preprocessTests } from '@term/call/code/test-preprocess'
 
 export type TestResult = { name: string; label: string; held: boolean }
@@ -57,6 +58,11 @@ export async function runTestFile(input: {
   resolve: Resolver
   env: NativeEnv
   readRuntime: (path: string) => string | undefined
+  // the project's role and lean readers (`term test` passes them, the dev harness has no role.tree). A test file
+  // imports code units, and a unit under a `mark lean` rule has to be milled lean here exactly as `term make`
+  // mills it, or every property head in it is an unknown name and the file "did not compile"
+  roleOf?: RoleOf
+  leanOf?: (file: string) => boolean
 }): Promise<TestRun> {
   // expand `test <phrase>` blocks into top-level tasks; a file with none passes through unchanged
   const { text, labels } = preprocessTests(input.source)
@@ -64,7 +70,7 @@ export async function runTestFile(input: {
   const result = compile(
     // use the real file path as the entry so `@/...` local-package aliases resolve against this file's deck.tree
     { file: input.file, text },
-    { resolve: input.resolve },
+    { resolve: input.resolve, roleOf: input.roleOf, leanOf: input.leanOf },
   )
 
   if (!result.ok) {

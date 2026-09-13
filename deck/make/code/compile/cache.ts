@@ -22,7 +22,13 @@ import type { Diagnostic } from '@term/make/code/parser/diagnostic'
 //
 // `7` is the grammar reader (mint-bridge-0004, 2026-09-01). There is one reader again, so the epoch is a plain
 // number again, and the bump is what retires every entry the hand-written one left behind.
-export const CACHE_EPOCH = '7'
+//
+// `8` is the lean surface (note/term/lean.md, 2026-09-12): the bridge partitions a marked construct's
+// arguments, `mine task` reads an anonymous task's name with `mine word`, a bare path operand is a member
+// read, `void` is the literal in an open call's arguments, and the open call folds builtins. Every one changes
+// what a unit mills to with its text unchanged, and the Sanskrit port spent an hour on `term make` reporting
+// errors the source no longer had before the key was read. lean-0034 is keying this on the build itself.
+export const CACHE_EPOCH = '8'
 
 // A cached entry, or nothing. A CORRUPT ENTRY IS A MISS, never a crash: the store writes atomically, but a
 // full disk, a killed process on a filesystem that does not honour the rename, or a half-synced network share

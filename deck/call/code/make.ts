@@ -22,7 +22,7 @@ import { projectCache } from '@term/call/code/cache-store'
 import { preprocessTests } from '@term/call/code/test-preprocess'
 import { isLockfileAt, isRoleFileAt, manifestNameOf } from '@term/call/code/manifest-name'
 import { projectDeckOf } from '@term/call/code/deck-of'
-import { projectRoleOf } from '@term/call/code/role-of'
+import { projectRoleOf, projectLeanOf } from '@term/call/code/role-of'
 import { parse } from '@term/make/code/parser/tree'
 import {
   compileFeedMine,
@@ -528,6 +528,8 @@ export function compileProject(
   const resolve = projectResolver(root)
   const deckOf = projectDeckOf()
   const roleOf = projectRoleOf(root)
+  // `mark lean` on a role rule, read off the same role files: which units take the lean surface
+  const leanOf = projectLeanOf(root)
   // ONE PARSE MEMO FOR THE WHOLE PROJECT, not one per file. Every entry walks its import closure to work out its
   // cache key, and that walk runs before the cache can be asked, so a memo per entry re-parses the stdlib for every
   // file in the project. See makeParseMemo in compile/load.ts.
@@ -586,7 +588,10 @@ export function compileProject(
 
     const result = compile(
       { file, text },
-      { resolve, cache, parsed, deckOf, roleOf },
+      // leanOf beside roleOf: a unit's role rule may carry `mark lean`, and the mill has to be told. Left out
+      // here on 2026-09-12 while compileSeparate had it, so `term make` read every lean grammar long-form and
+      // reported every property head as an unknown name.
+      { resolve, cache, parsed, deckOf, roleOf, leanOf },
     )
 
     if (!result.ok) {
@@ -733,7 +738,13 @@ export function compileProjectSeparate(
       { file, text },
       // roleOf comes along: a unit compiled separately has to be asked the same question about its role as one
       // compiled through the merged path, or the two disagree about whether a `hook` is a command or a route
-      { resolve, cache, modules: f => `./${slug(f)}`, roleOf: projectRoleOf(root) },
+      {
+        resolve,
+        cache,
+        modules: f => `./${slug(f)}`,
+        roleOf: projectRoleOf(root),
+        leanOf: projectLeanOf(root),
+      },
     )
 
     if (!result.ok) {

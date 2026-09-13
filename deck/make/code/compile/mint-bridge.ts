@@ -48,6 +48,7 @@ import { parse } from '@term/make/code/parser/tree'
 import {
   readMineGrammar,
   readMintGrammar,
+  readLeanRules,
 } from '@term/make/code/compile/mill-run'
 import type {
   MineGrammar,
@@ -142,6 +143,10 @@ type Bridge = {
   file: string
   // the file's role: `site` means every `hook` here is a URL route, `call` means every one is a CLI command
   role?: string
+  // `mark lean` on the file's role rule: a bare head is a call, a property head is a named argument. The pass
+  // that acts on it runs before any minting, so by the time this bridge reads anything the match is already the
+  // longhand one. Carried here only so a diagnostic can say which surface a file was read with.
+  lean?: boolean
   diagnostics: Diagnostic[]
   // the form a nested `task` belongs to: its methods are mangled `<form>_<name>` and a bare `take self` takes
   // the form's own type
@@ -157,7 +162,7 @@ type Bridge = {
   // The grammar this program is being read with, so a sub-expression found inside something the grammar does
   // not descend into can still be read BY the grammar. The one place that needs it is a `{{...}}` runtime
   // interpolation, whose contents are a value the text literal holds rather than a node the mine walked.
-  grammar: { mine: MineGrammar; mint: MintGrammar }
+  grammar: Grammar
 }
 
 // Read one node as a value, through the grammar, so an interpolation's contents are lowered by the same rules
@@ -227,6 +232,53 @@ function unhandled(bridge: Bridge, value: Minted, what: string): undefined {
       file: bridge.file,
       span: spanOf(value),
       message: `the mint bridge does not build ${what} yet`,
+    }),
+  )
+
+  return undefined
+}
+
+// Every head `mine flow` lists as a statement (mill/code/code/tool/flow/mine.tree), in that file's own order.
+// None of them can be a bare-head call: the grammar matches the statement rule first, so a word from this set
+// arriving as a lean CALLEE means its own rule refused the line and the generic "an unknown head is a call"
+// fallback took it.
+const FLOW_HEADS = new Set([
+  'hold',
+  'call',
+  'save',
+  'send',
+  'back',
+  'fork',
+  'halt',
+  'bust',
+  'walk',
+  'turn',
+  'fuse',
+  'rest',
+  'note',
+  'read',
+  'free',
+  'make',
+  'move',
+  'host',
+])
+
+// A statement head read as a lean call. The comma rule pops exactly ONE level, so `back substring one, 0, 1`
+// leaves `1` beside `substring` rather than inside it, and `fork test, is-equal size(x), 1` leaves `1` beside
+// the condition. Either way the statement head ends up with two children where its rule allows one, and the
+// old message named the head as an undefined task. Name the real cause and the two ways out of it instead.
+function commaTrap(
+  bridge: Bridge,
+  value: Minted,
+  head: string,
+  span: Span,
+): undefined {
+  bridge.diagnostics.push(
+    diagnose('unexpected-node', {
+      file: bridge.file,
+      span,
+      message: `\`${head}\` is a statement, and this line gives it more than it takes, so it was read as a call to a task named \`${head}\``,
+      hint: 'a comma pops exactly one level, so an inline call after one is left open and swallows what follows. Parenthesize the inner call (`back substring(one, 0, 1)`), or put the arguments on their own indented lines',
     }),
   )
 
@@ -548,12 +600,22 @@ function expressionOf(
         ? { form: 'float', value: value.value, span }
         : { form: 'integer', value: value.value, span }
     case 'word':
-      // a bare word in value position is `true`, `false`, or a name
+      // a bare word in value position is `true`, `false`, `void`, or a name
       if (value.value === 'true' || value.value === 'false') {
         return { form: 'boolean', value: value.value === 'true', span }
       }
 
-      return { form: 'variable', name: plainName(value.value), span }
+      // `void` reaches here as a word from a lean call's argument list (`is-equal found, void`), where the
+      // longhand's `seed` site would have carried it as the literal. A variable cannot be called `void`.
+      if (value.value === 'void') {
+        return { form: 'unit', span }
+      }
+
+      // THROUGH readPath, so `x/a` in value position is a member read and not a variable named "x/a". The
+      // callee slot always went through it and the value slot did not, so `letters/flat-map` as a head
+      // worked and `x/a` as an argument resolved to nothing and said nothing (lean-0019, probed 2026-09-12).
+      // Under lean a bare word is the ordinary way to name a value, so this stopped being a corner.
+      return readPath(plainName(value.value), span)
     case 'form':
       break
   }
@@ -645,7 +707,9 @@ function expressionOf(
     case 'fork-test': {
       const built = conditionOf(bridge, value)
 
-      return built?.form === 'if' ? asConditional(built, span) : undefined
+      return built?.form === 'if'
+        ? asConditional(bridge, built, span)
+        : undefined
     }
 
     case 'seed-meet': {
@@ -707,6 +771,44 @@ function expressionOf(
         return unhandled(bridge, value, 'an open call with no head')
       }
 
+      // THE COMMA TRAP. Under lean a bare head is a call, so a STATEMENT head whose own grammar rule refused
+      // the line arrives here as a callee and the failure is reported as `the name "fork" is not defined`,
+      // pointing at the whole line with nothing wrong on it. The cause is always the same: a comma popped out
+      // of an inline construction and left the statement head holding one argument too many.
+      if (
+        isLean(bridge, 'seed-call-open') &&
+        FLOW_HEADS.has(plainName(callee))
+      ) {
+        return commaTrap(bridge, value, plainName(callee), span)
+      }
+
+      // the lean surface: property heads among the arguments become labels. Written order is kept the way
+      // `callOf` keeps it, by numbering the call's own children out of the parse tree.
+      if (isLean(bridge, 'seed-call-open')) {
+        const order = new Map<Node, number>()
+
+        if (value.node?.kind === 'group') {
+          value.node.nodes.forEach((child, index) => order.set(child, index))
+        }
+
+        const written = leanArguments(bridge, value, order).sort((a, b) => a.at - b.at)
+        const args = written.map(entry => entry.expr)
+        const names = written.map(entry => entry.name)
+        const leanNames = written.map(entry => entry.lean === true)
+
+        return (
+          foldBuiltin(plainName(callee), args, span) ?? {
+            form: 'call',
+            callee: readPath(plainName(callee), span),
+            args,
+            span,
+            ...(names.some(Boolean) ? { names } : {}),
+            ...(leanNames.some(Boolean) ? { leanNames } : {}),
+            lean: true,
+          }
+        )
+      }
+
       const args: Expression[] = []
 
       for (const seed of at(value, 'seed')) {
@@ -717,12 +819,17 @@ function expressionOf(
         }
       }
 
-      return {
-        form: 'call',
-        callee: readPath(plainName(callee), span),
-        args,
-        span,
-      }
+      // the arithmetic, comparison and boolean builtins fold to an operator here as they do under `call`:
+      // `and a, b` is `a && b`, not a call to something named `and`. Probed 2026-09-12 that it was not
+      // (note/term/lean.md, "meet and becomes and"), and the fold was only ever run from callOf.
+      return (
+        foldBuiltin(plainName(callee), args, span) ?? {
+          form: 'call',
+          callee: readPath(plainName(callee), span),
+          args,
+          span,
+        }
+      )
     }
 
     default:
@@ -764,11 +871,32 @@ function recordOf(bridge: Bridge, value: Form): Expression | undefined {
     }
   }
 
-  for (const seed of at(value, 'seed')) {
-    const built = expressionOf(bridge, seed)
+  // the lean surface: `make x / foo true / bar <baz>` fills the fields `foo` and `bar`. A property head among
+  // the positionals is a field, built as an array the checker unwraps against the field's declared type; the
+  // rest stay positional and fill the form's slots as they do today.
+  const lean = isLean(bridge, 'make')
 
-    if (built) {
-      positional.push(built)
+  if (lean) {
+    const order = new Map<Node, number>()
+
+    if (value.node?.kind === 'group') {
+      value.node.nodes.forEach((child, index) => order.set(child, index))
+    }
+
+    for (const entry of leanArguments(bridge, value, order)) {
+      if (entry.name !== undefined) {
+        fields.push({ name: entry.name, value: entry.expr })
+      } else {
+        positional.push(entry.expr)
+      }
+    }
+  } else {
+    for (const seed of at(value, 'seed')) {
+      const built = expressionOf(bridge, seed)
+
+      if (built) {
+        positional.push(built)
+      }
     }
   }
 
@@ -803,6 +931,7 @@ function recordOf(bridge: Bridge, value: Form): Expression | undefined {
       fields,
       ...(positional.length > 0 ? { positional } : {}),
       functionFree,
+      ...(lean ? { lean: true } : {}),
       span: spanOf(value),
     },
     value,
@@ -837,33 +966,76 @@ function closureOf(bridge: Bridge, value: Form): Expression | undefined {
   }
 }
 
-// the same branch structure as a statement `if`, carried in value position
+// A VALUE-POSITION FORK IS AN EXPRESSION, so each of its arms is one value and has nowhere to put a statement.
+// An arm that holds one anyway used to make this return `undefined`, the caller drop the whole fork, and the
+// backend emit `undefined` as the value: every augmented athematic form came out `undefinedasmi` and every
+// absolutive read "having undefined", both clean builds. Say what the arm did instead, and name the statement.
 function asConditional(
+  bridge: Bridge,
   built: Extract<Statement, { form: 'if' }>,
   span: Span,
 ): Expression | undefined {
   const branches: { cond: Expression; value: Expression }[] = []
 
+  const refuse = (at: Span, what: string): undefined => {
+    bridge.diagnostics.push(
+      diagnose('unexpected-node', {
+        file: bridge.file,
+        span: at,
+        message: `a fork in value position is one value per arm, and this arm ${what}`,
+        hint: 'bind the value first (`save x` before the fork, and each arm a plain value), or make the fork a statement whose arms each `send back`',
+      }),
+    )
+
+    return undefined
+  }
+
   for (const branch of built.branches) {
     const only = branch.body[0]
 
-    if (branch.body.length !== 1 || only?.form !== 'expression') {
-      return undefined
+    if (branch.body.length === 0) {
+      return refuse(branch.cond.span, 'is empty')
+    }
+
+    if (branch.body.length > 1) {
+      return refuse(
+        branch.body[1]!.span,
+        `holds ${branch.body.length} statements`,
+      )
+    }
+
+    if (only?.form !== 'expression') {
+      return refuse(only!.span, `holds a \`${only!.form}\` statement`)
     }
 
     branches.push({ cond: branch.cond, value: only.expr })
   }
 
-  const last = built.otherwise?.[0]
-  const otherwise =
-    built.otherwise && built.otherwise.length === 1
-      ? last?.form === 'expression'
-        ? last.expr
-        : // an else-if chain: the else is another conditional, carried in value position too
-          last?.form === 'if'
-          ? asConditional(last, last.span)
-          : undefined
-      : undefined
+  let otherwise: Expression | undefined
+
+  if (built.otherwise) {
+    const last = built.otherwise[0]
+
+    if (built.otherwise.length > 1) {
+      return refuse(
+        built.otherwise[1]!.span,
+        `holds ${built.otherwise.length} statements`,
+      )
+    }
+
+    if (last?.form === 'expression') {
+      otherwise = last.expr
+    } else if (last?.form === 'if') {
+      // an else-if chain: the else is another conditional, carried in value position too
+      otherwise = asConditional(bridge, last, last.span)
+
+      if (!otherwise) {
+        return undefined
+      }
+    } else if (last) {
+      return refuse(last.span, `holds a \`${last.form}\` statement`)
+    }
+  }
 
   return {
     form: 'conditional',
@@ -973,6 +1145,90 @@ function readPath(path: string, span: Span): Expression {
   return node
 }
 
+// ---- the lean surface ----
+
+// Does this construct take lean labels in this file: the file's role is marked lean AND the grammar rule that
+// read the construct carries `mark lean`. Both, so a lean file still reads a `take` or a `walk` as itself.
+function isLean(bridge: Bridge, rule: string): boolean {
+  return bridge.lean === true && bridge.grammar.lean?.has(rule) === true
+}
+
+// One argument as it was written, with where it sat among the construct's children so a label written before a
+// positional argument stays before it. `callOf` invented this ordering for `bind`; the lean partition shares it.
+// `lean` marks a label that came from a PROPERTY HEAD rather than an explicit `bind`: the checker refuses to
+// drop the first kind and treats the second as documentation, as it always did.
+type Written = { at: number; expr: Expression; name: string | undefined; lean?: boolean }
+
+// The lean partition of a construct's `seed` captures. A capture that is itself a bare-head call with a plain
+// name is a NAMED argument: the head is the label and its own arguments are the value, built as an ARRAY so the
+// checker can decide by the parameter's declared type whether it is one value or a list. Anything else stays
+// positional and is built exactly as it would be without lean.
+//
+// A bare word stays a VARIABLE here, on purpose. Whether `strict` under a call is a flag or a value depends on
+// whether the callee has a boolean parameter called `strict`, and the mill has no callee to ask. The checker
+// does: `arrangeArguments` turns a positional variable that names an unfilled boolean parameter into that label
+// set to true. Position first, then the name, with the schema where the schema is.
+//
+// `seed-bind-arg` (`bind x, v` in an open call) drops its name today and keeps dropping it outside lean. Under
+// lean the name is kept, which is what makes `bind` the long-form escape inside a lean call.
+function leanArguments(
+  bridge: Bridge,
+  value: Form,
+  order: Map<Node, number>,
+): Written[] {
+  const written: Written[] = []
+
+  for (const seed of at(value, 'seed')) {
+    const index = seed.node ? (order.get(seed.node) ?? written.length) : written.length
+
+    if (seed.kind === 'form' && seed.form === 'seed-call-open') {
+      const head = wordAt(seed, 'name')
+
+      if (head !== undefined && !head.includes('/')) {
+        const items: Expression[] = []
+
+        for (const inner of at(seed, 'seed')) {
+          const built = expressionOf(bridge, inner)
+
+          if (built) {
+            items.push(built)
+          }
+        }
+
+        written.push({
+          at: index,
+          name: plainName(head),
+          expr: { form: 'array', items, span: spanOf(seed) },
+          lean: true,
+        })
+        continue
+      }
+    }
+
+    if (seed.kind === 'form' && seed.form === 'seed-bind-arg') {
+      // the name is the first child; `mine seed-bind-arg` matches it as a bare node, so read it off the CST
+      const label =
+        seed.node?.kind === 'group' && seed.node.nodes[1]?.kind === 'group'
+          ? wordOf(seed.node.nodes[1].nodes[0])
+          : undefined
+      const built = expressionOf(bridge, firstAt(seed, 'seed'))
+
+      if (built) {
+        written.push({ at: index, name: label, expr: built })
+        continue
+      }
+    }
+
+    const built = expressionOf(bridge, seed)
+
+    if (built) {
+      written.push({ at: index, name: undefined, expr: built })
+    }
+  }
+
+  return written
+}
+
 function callOf(bridge: Bridge, value: Form): Expression | undefined {
   const name = wordAt(value, 'name')
 
@@ -1009,15 +1265,19 @@ function callOf(bridge: Bridge, value: Form): Expression | undefined {
     }
   }
 
-  for (const seed of at(value, 'seed')) {
-    const built = expressionOf(bridge, seed)
+  if (isLean(bridge, 'call')) {
+    written.push(...leanArguments(bridge, value, order))
+  } else {
+    for (const seed of at(value, 'seed')) {
+      const built = expressionOf(bridge, seed)
 
-    if (built) {
-      written.push({
-        at: seed.node ? (order.get(seed.node) ?? written.length) : written.length,
-        expr: built,
-        name: undefined,
-      })
+      if (built) {
+        written.push({
+          at: seed.node ? (order.get(seed.node) ?? written.length) : written.length,
+          expr: built,
+          name: undefined,
+        })
+      }
     }
   }
 
@@ -1089,6 +1349,7 @@ function callOf(bridge: Bridge, value: Form): Expression | undefined {
           args,
           span,
           ...(names.some(Boolean) ? { names } : {}),
+          ...(isLean(bridge, 'call') ? { lean: true } : {}),
           ...(propagate ? { propagate: true } : {}),
           ...(background ? { background: true } : {}),
         } as Expression))
@@ -3419,9 +3680,18 @@ function outlineOf(node: Node | undefined): string {
 
 // The baked grammar, parsed once. `pnpm term:mill-bundle` writes the text; parsing it is cheap and happens on
 // the first compile rather than at import time, so a tool that never mills never pays for it.
-let baked: { mine: MineGrammar; mint: MintGrammar } | undefined
+// `lean` is the set of `mine` rules marked `mark lean`, read off the same source. Optional on the type so the
+// parity gate, which loads a grammar from disk and passes it in, keeps typechecking; a grammar without it
+// simply has no lean rules, and the lean surface does nothing in it.
+export type Grammar = {
+  mine: MineGrammar
+  mint: MintGrammar
+  lean?: Set<string>
+}
 
-function bakedGrammar(): { mine: MineGrammar; mint: MintGrammar } {
+let baked: Grammar | undefined
+
+function bakedGrammar(): Grammar {
   if (!baked) {
     const mine = parse({ file: 'code-mine.tree', text: MINE_SOURCE })
     const mint = parse({ file: 'code-mint.tree', text: MINT_SOURCE })
@@ -3429,6 +3699,7 @@ function bakedGrammar(): { mine: MineGrammar; mint: MintGrammar } {
     baked = {
       mine: mine.ok ? readMineGrammar(mine.tree) : new Map(),
       mint: mint.ok ? readMintGrammar(mint.tree) : new Map(),
+      lean: mine.ok ? readLeanRules(mine.tree) : new Set(),
     }
   }
 
@@ -3444,11 +3715,15 @@ export function millByGrammar(
   role?: string,
   // the grammar to read with. Omitted, the baked one is used, which is what the compiler does; the parity gate
   // passes the one it loaded from disk so a grammar edit is measured before it is baked.
-  grammar: { mine: MineGrammar; mint: MintGrammar } = bakedGrammar(),
+  grammar: Grammar = bakedGrammar(),
+  // `mark lean` on the file's role rule. The pass runs over the MATCH below, before anything mints, so every
+  // reader downstream of it sees the longhand shape and cannot tell the two spellings apart. note/term/lean.md.
+  lean?: boolean,
 ): MillResult {
   const bridge: Bridge = {
     file,
     role,
+    lean,
     diagnostics: [],
     declared: new Set(),
     aliases: new Map(),

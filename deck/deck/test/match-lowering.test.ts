@@ -85,7 +85,12 @@ task open
 `)
 
     expect(ts).toContain('.form === "full"')
-    expect(ts).toContain('.form === "void"')
+
+    // and the LAST arm of an exhaustive match closes with a plain `else`, exactly as the boolean case above
+    // does. Both arms tested `.form` until 2026-09-12, and a task whose arms all return then read to
+    // TypeScript as one that could fall out of the bottom: 43 such functions in the v4 Sanskrit grammar.
+    expect(ts).not.toContain('.form === "void"')
+    expect(ts).toContain('} else {')
   })
 
   it('parenthesizes a compound subject before .form', () => {

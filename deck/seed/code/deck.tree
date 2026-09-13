@@ -76,6 +76,11 @@ form deck-find
 form deck-role
   # `role <name>` with its `take` globs: which files a role reads
   link name, like text
+  # `mark <name>` flags on the rule: how the files it matches are READ, rather
+  # than which mill reads them. `lean` is the only one today. A LIST of words
+  # rather than one field per flag, because a mint `case` selects by capture site
+  # and cannot filter by a mark's name.
+  link mark, list text
   link take, list deck-take
 
 form deck-take

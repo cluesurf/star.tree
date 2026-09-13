@@ -174,6 +174,8 @@ export function readView(
   // want; a project supplies one and then every name a document says is checked against it.
   catalog?: ViewCatalog,
   caps: ViewCaps = VIEW_CAPS,
+  // the lean surface for a placement's inputs. See ViewCheck.lean
+  lean = false,
 ): ViewResult {
   const diagnostics: Diagnostic[] = []
 
@@ -688,6 +690,22 @@ export function readView(
             continue
           }
 
+          // the lean surface: a plain-name child that is not a body node and carries a value is a `bind`
+          // whose term is its own head. The body heads are a closed set, so nothing is guessed.
+          if (lean && isLeanBind(child)) {
+            const one = readLeanBind(child)
+
+            if (one) {
+              if (bind.some(had => had.term === one.term)) {
+                error(one.span, `"${one.term}" is bound twice on "${name}"`)
+              } else {
+                bind.push(one)
+              }
+            }
+
+            continue
+          }
+
           const one = readNode(child)
 
           if (one) {
@@ -988,6 +1006,35 @@ export function readView(
     }
 
     const bond = readSeed(valueNode)
+
+    return bond ? { term, bond, span } : undefined
+  }
+
+  // `label <save>` under a lean placement: a head that is not a body head, over a value
+  function isLeanBind(child: GroupNode): boolean {
+    const head = headOf(child)
+
+    return head !== undefined && !BODY_HEADS.has(head) && child.nodes.length > 1
+  }
+
+  // the same shape `readBind` reads, with the term taken from the head rather than from the word after `bind`
+  function readLeanBind(group: GroupNode): Bind | undefined {
+    const span = spanOf(group)
+    const term = headOf(group)
+
+    if (!term) {
+      return undefined
+    }
+
+    const values = rest(group)
+
+    if (values.length > 1) {
+      error(span, `"${term}" is given ${values.length} values, and a component input takes one`)
+
+      return undefined
+    }
+
+    const bond = readSeed(values[0]!)
 
     return bond ? { term, bond, span } : undefined
   }
@@ -2007,6 +2054,11 @@ export type ViewCheck = {
   // is imported with `load`, so a document that fuses one gets it from here. Without it the `fuse` expands to
   // nothing and the document silently renders less than it says. See note/term/view/02-macro.md.
   templates?: Map<string, Template>
+  // `mark lean` on the document's role rule: inside a placement, a plain-name child with a value is a `bind`,
+  // so `view button / label <save> / size 2` is `bind label, <save> / bind size, 2`. Bounded to the inputs of a
+  // placement on purpose: the sandbox's statement heads are unchanged, and dropping the `view` head itself
+  // needs the catalog and waits for the view mill (note/term/lean.md, lean-0029).
+  lean?: boolean
 }
 
 export function checkView(
@@ -2070,6 +2122,7 @@ export function checkView(
     source.file,
     options.catalog,
     options.caps,
+    options.lean ?? false,
   )
 }
 
@@ -2335,6 +2388,10 @@ const ZERO: Span = { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } 
 
 // ---- node helpers ----
 // Local, following compile/host.ts, so the reader stays independent of the code mill.
+
+// the body heads a placement may hold, which a lean property is never confused with. Module scope, because the
+// closures in readView run before any `const` declared after them in that function would be initialised.
+const BODY_HEADS = new Set(['bind', 'seed', 'view', 'text', 'walk', 'fork', 'hook'])
 
 function headOf(group: GroupNode): string | undefined {
   const head = group.nodes[0]

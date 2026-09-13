@@ -26,7 +26,10 @@ load @term/mill/code/code/wait/mine
 # The callee used to be read with `mine path`, which walks a head plus every term nested under it into one
 # phrase. That is right for a multi-word type (`like stack number`) and wrong here: `call f(read a, read b)`
 # read as a callee literally named "f read a" and dropped `read b` on the floor (mint-bridge-0002).
+# `mark lean`: opted in to the lean surface. See `mine seed-call-open` in ../seed/mine.tree for what that means
+# and why it is declared per rule rather than derived.
 mine call
+  mark lean
   mine term, term call
     mine open
       site name

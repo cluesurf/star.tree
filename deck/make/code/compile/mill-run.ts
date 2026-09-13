@@ -355,6 +355,41 @@ export function readMineGrammar(tree: RootNode): MineGrammar {
   return grammar
 }
 
+// The `mine` rules that carry a `mark lean` child: the constructs that take the lean surface, where a bare-head
+// argument becomes a NAMED argument in a file whose role is marked lean. Declared per rule and read here, never
+// derived from the rule's shape. The shape-derived version ("a rule with a `bind` site") was measured on
+// 2026-09-12 and refused: thirty rules have one, and at least seven must never take labels. note/term/lean.md.
+//
+// `readMineRule` never sees the marker, because it reads only `mine` children and a `mark` is not one, so the
+// rules themselves are unchanged by it.
+export function readLeanRules(tree: RootNode): Set<string> {
+  const lean = new Set<string>()
+
+  for (const group of tree.nodes) {
+    if (headWord(group) !== 'mine') {
+      continue
+    }
+
+    const name = wordOf(group.nodes[1])
+
+    if (!name) {
+      continue
+    }
+
+    for (const child of group.nodes.slice(2)) {
+      if (
+        child.kind === 'group' &&
+        headWord(child) === 'mark' &&
+        wordOf(child.nodes[1]) === 'lean'
+      ) {
+        lean.add(name)
+      }
+    }
+  }
+
+  return lean
+}
+
 // ---- matching ----
 
 // run one rule sequence against a node cursor. Returns the new cursor position, or undefined on no match.

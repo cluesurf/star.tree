@@ -118,6 +118,16 @@ export type Expression =
       // named arguments (`call f / bind a, 200 / bind b, 100`): one entry per arg, the label of a `bind` child or
       // undefined for a positional one. The checker reorders `args` into the callee's declared order and drops this.
       names?: (string | undefined)[]
+      // the call was read with the LEAN surface (its file's role carries `mark lean`), and every named argument
+      // that came from a property head (`key <tense>`) was built as an ARRAY of that head's children. The checker
+      // unwraps a one-item array where the parameter is not a list, by the declared type and never by the count,
+      // and drops this beside `names`. Set by the mill; nothing past the checker sees it. See note/term/lean.md.
+      lean?: boolean
+      // aligned with `names`: true where the label came from a PROPERTY HEAD rather than an explicit `bind`. The
+      // checker refuses to drop the first kind on a callee it cannot see, and treats the second as documentation
+      // the way it always did, so the stdlib's `call push / bind list, ... / bind item, ...` on a receiver method
+      // keeps working under lean.
+      leanNames?: boolean[]
       // `wait false`: a fire-and-forget call. It is made but never awaited, even when the callee is async, and it does
       // not make the caller async. Async resolution skips it; without this flag an async call is awaited by default.
       background?: boolean
@@ -149,6 +159,9 @@ export type Expression =
       // true when no bound value is a function literal (a closure), so the constructed record is pure data and
       // serialises to JSON. The base bridge lifts a function-free record into a `RecordNode`. Computed at mill time.
       functionFree?: boolean
+      // read with the lean surface: a field that came from a property head holds an array of that head's
+      // children, unwrapped by the checker against the field's declared type. Same contract as a call's `lean`.
+      lean?: boolean
     }
   | {
       form: 'member'
@@ -239,6 +252,11 @@ export type Statement =
       // the shared fields the arm binds off the carrier and the props it binds off the form's `link` record, so every
       // backend lowers the arm the same way (`form` is the discriminant). note/term/hive/11-native-exceptions.md
       exceptionArms?: Record<string, { shared: string[]; link: string[] }>
+      // FILLED BY THE CHECKER WHEN THE ARMS COVER EVERY VARIANT and there is no `otherwise`. The checker
+      // already works this out to report `non-exhaustive`; saying so on the node lets a backend close the
+      // chain with a plain `else` instead of a last `if`, which is what a host's own return analysis needs
+      // in order to see that a task whose arms all return cannot fall out of the bottom.
+      closed?: boolean
     }
   | {
       form: 'for-each'

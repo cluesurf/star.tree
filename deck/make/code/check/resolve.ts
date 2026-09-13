@@ -114,10 +114,18 @@ export function resolve(
   // datatype NAMES, so a type used as a first-class VALUE (`send back nat`, the decoder `El : U -> Type` of
   // induction-recursion, or a container's positions) resolves rather than reading as an undefined name.
   const typeNames = new Set<string>()
+  // VARIANT names, for the lean surface: a bare head that names a case of a sum (`feature feature <case>,
+  // value <nominative>`) is a construction of that case, and the checker rewrites it into one. It has no binding
+  // here and is not a type name, so without this set the resolver reported every such head as undefined.
+  const variantNames = new Set<string>()
 
   for (const statement of program) {
     if (statement.form === 'record-type') {
       typeNames.add(statement.name)
+
+      for (const variant of statement.variants ?? []) {
+        variantNames.add(variant.name)
+      }
 
       // a variantless record is matched under its OWN name (`case context, base name, base failures`), so its
       // record-level fields have to bind in that branch exactly as a variant's fields do. Without this the `base`
@@ -206,9 +214,37 @@ export function resolve(
         resolveExpression(node.operand)
         break
       case 'call':
-        resolveExpression(node.callee)
+        // THE LEAN SURFACE: a bare head naming a variant is a construction of that case, which the checker's
+        // arrangeArguments rewrites into a record. It binds to nothing here, so it is left for the checker rather
+        // than reported as undefined. A head naming a form is already fine: a type is a first-class value.
+        if (
+          !(
+            node.lean &&
+            node.callee.form === 'variable' &&
+            !look(node.callee.name) &&
+            variantNames.has(node.callee.name)
+          )
+        ) {
+          resolveExpression(node.callee)
+        }
 
         for (const arg of node.args) {
+          // THE LEAN SURFACE: a bare word among a lean call's arguments may be a FLAG (`strict` naming a boolean
+          // parameter of the callee) rather than a variable, and only the checker, which holds the signature,
+          // can say which. So an unbound word here is left unresolved rather than diagnosed, and
+          // `arrangeArguments` either turns it into that parameter set to true or reports the unknown name
+          // itself. A word that IS in scope binds as it always did, so a callback passed by name is untouched.
+          if (
+            node.lean &&
+            arg.form === 'variable' &&
+            !look(arg.name) &&
+            !typeNames.has(arg.name) &&
+            !(arg.name in BINARY_BUILTIN) &&
+            !UNARY_BUILTIN.has(arg.name)
+          ) {
+            continue
+          }
+
           resolveExpression(arg)
         }
 

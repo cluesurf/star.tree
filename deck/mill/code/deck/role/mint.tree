@@ -7,12 +7,19 @@ load @term/seed/code/deck
 mint role, like deck-role
   case name
     site name
+  case mark, mint role-mark
+    site mark
   case take, mint role-take
     site take
   hook make
     make deck-role
       bind name, read name
+      bind mark, read mark
       bind take, read take
+
+mint role-mark
+  case name
+    site name
 
 mint role-take, like deck-take
   case glob

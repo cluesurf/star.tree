@@ -57,6 +57,10 @@ export function parseRoleFileByHand(input: {
 
     rules.push({
       name: form.terms[0] ?? '',
+      // `mark <name>`: a flag on the rule, not a glob. See RoleRule in ./form.
+      mark: formsWith(form, 'mark')
+        .map(entry => entry.value ?? termsOf(entry))
+        .filter(Boolean),
       take: formsWith(form, 'take').map(entry => ({
         // a glob is either bare (`@/code/**/*.tree`) or quoted when it contains
         // braces (`<@/book/**/\{code,view\}/**/*.tree>`), which read as a value.
@@ -84,6 +88,21 @@ export function matchRole(input: {
   filePath: string
   config: RoleConfig
 }): string | null {
+  return matchRoleRule(input)?.name ?? null
+}
+
+/**
+ * The matched RULE rather than its name, so a caller can read its `mark` flags.
+ *
+ * THE FIRST MATCHING RULE WINS, which is what lets one role name appear twice with different marks: a narrow
+ * `role code / mark lean / take @/code/grammar/**` written above a broad `role code / take @/code/**` scopes
+ * lean to a subtree. Nothing sorts or merges the rules, and nothing may start to: written order IS the
+ * precedence, and a file's meaning depends on it.
+ */
+export function matchRoleRule(input: {
+  filePath: string
+  config: RoleConfig
+}): RoleRule | null {
   const { filePath, config } = input
 
   for (const rule of config.rules) {
@@ -100,7 +119,7 @@ export function matchRole(input: {
         }
 
         if (!excluded) {
-          return rule.name
+          return rule
         }
       }
     }

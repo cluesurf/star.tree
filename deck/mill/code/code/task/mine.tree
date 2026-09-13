@@ -52,8 +52,12 @@ load @term/mill/code/code/form/mine
 # top-level `task` with no name builds nothing at all rather than failing.
 mine task
   mine term, term task
+    # `mine word`, not `mine term`. A bare `mine term` takes a group's HEAD, so for an ANONYMOUS task in value
+    # position (`call f / task / take one, like x / ...`) it took the first `take` line as the name "take" and
+    # dropped that parameter on the floor: the closure came out with `params: []` and its body read a name
+    # bound to nothing (lean-0014, probed 2026-09-12). Only a word with nothing under it is a name.
     mine maybe
-      mine term
+      mine word
         site name
     mine list
       mine any

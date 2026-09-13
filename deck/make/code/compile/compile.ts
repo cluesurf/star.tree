@@ -164,6 +164,10 @@ export function compile(
     // the role a project's `role.tree` gives a file (`host` for data, `code` for a program), overriding the content
     // rule below. Undefined or null means no role names the file, so its content decides. See deck/deck/code/role.ts
     roleOf?: (file: string) => string | null | undefined
+    // whether a file's role rule carries `mark lean`: its bare heads are calls and its property heads are named
+    // arguments. Off for every file no marked rule matches, which is almost all of them. See note/term/lean.md
+    // and deck/call/code/role-of.ts.
+    leanOf?: (file: string) => boolean | undefined
   },
 ): CompileResult {
   // a look stylesheet (.tree whose top-level statements are all `face` / `tone` / `base`) is not a normal compile
@@ -184,7 +188,8 @@ export function compile(
   const role = options?.roleOf?.(source.file)
 
   if (role === 'host' || (!role && isDataFile(source))) {
-    return compileData(source)
+    // the lean surface for data: only ever under the mark, since the content rule does not know it
+    return compileData(source, role === 'host' && (options?.leanOf?.(source.file) ?? false))
   }
 
   // collect the entry plus every module it loads (so the stdlib supplies the form definitions), dependencies
@@ -209,9 +214,19 @@ export function compile(
 
   // output cache: an exact module graph (every file at its current content) compiles to one result. A re-save with
   // no edits anywhere is an instant hit.
+  //
+  // EACH UNIT'S ROLE AND LEAN ARE IN THE KEY, beside its text. The output level caches a FAILURE as readily as a
+  // success, and a caller that compiled the same graph without the readers (the roll pass, the test runner, a
+  // worker, all of which did on 2026-09-12) stored its unknown-name diagnostics under a key the fixed caller then
+  // hit, so the fix read as not working until `term wash deck`. Text alone cannot tell the two reads apart (lean-0034).
   const graphKey =
     sources
-      .map(unit => `${unit.file}@${hashText(unit.text)}`)
+      .map(unit => {
+        const role = options?.roleOf?.(unit.file) ?? ''
+        const lean = options?.leanOf?.(unit.file) ? '#lean' : ''
+
+        return `${unit.file}@${hashText(unit.text)}${role ? `#${role}` : ''}${lean}`
+      })
       .join('|') +
     (options?.modules ? '|modules' : '') +
     (options?.optimize === false ? '|raw' : '') +
@@ -261,14 +276,20 @@ export function compile(
       // the role a project's `role.tree` gives this module. A `view` file is the sandboxed document dialect and is
       // read by compile/view.ts, not by the code mill. See note/term/view/06-mill.md.
       const unitRole = options?.roleOf?.(unit.file) ?? undefined
+      // `mark lean` on the matched role rule: this unit's bare heads are calls and its property heads are named
+      // arguments. IN THE CACHE KEY BELOW, because it changes what the unit mills to. Left out, a file that gains
+      // the mark keeps its old AST until its text changes, and the bug reads as the feature not working at all.
+      // Prefixed rather than appended, so it cannot be confused with a role whose name ends in the same letters.
+      const unitLean = options?.leanOf?.(unit.file) ?? false
+      const leanKey = unitLean ? 'lean:' : ''
 
       const milled = cache
         ? cache.milledUnit(
-            `${unit.file}\u0000${templateKey}\u0000${unitRole ?? ''}`,
+            `${leanKey}${unit.file}\u0000${templateKey}\u0000${unitRole ?? ''}`,
             unit.text,
-            () => millUnit(unit, parsed, templates, unitRole),
+            () => millUnit(unit, parsed, templates, unitRole, unitLean),
           )
-        : millUnit(unit, parsed, templates, unitRole)
+        : millUnit(unit, parsed, templates, unitRole, unitLean)
 
       if (!milled.ok) {
         return { ok: false, diagnostics: milled.diagnostics }
@@ -331,8 +352,8 @@ export function compile(
 
 // a data file to a TypeScript module: `export default <json>`. The value is also exported as `data`, so a Term
 // program that loads the module through the per-module path has a name to find.
-function compileData(source: { file: string; text: string }): CompileResult {
-  const read = readDataText(source)
+function compileData(source: { file: string; text: string }, lean = false): CompileResult {
+  const read = readDataText(source, lean)
 
   if (!read.ok) {
     return { ok: false, diagnostics: read.diagnostics }
@@ -360,6 +381,7 @@ function millUnit(
   parseOf: ParseMemo,
   templates?: Map<string, Template>,
   role?: string,
+  lean?: boolean,
 ):
   | { ok: true; program: Program }
   | { ok: false; diagnostics: Diagnostic[] } {
@@ -376,7 +398,7 @@ function millUnit(
   // cannot answer differently about what a document may say. It is handed the tree already parsed and the whole
   // graph's templates, so a document is parsed once and a macro imported from another module expands.
   if (role === 'view') {
-    const read = checkView(unit, { tree: parsed.tree, templates })
+    const read = checkView(unit, { tree: parsed.tree, templates, lean })
 
     if (!read.ok) {
       return { ok: false, diagnostics: read.diagnostics }
@@ -387,7 +409,7 @@ function millUnit(
 
   const expanded = expandTemplates(parsed.tree, templates)
 
-  return mill(expanded, unit.file, role)
+  return mill(expanded, unit.file, role, lean)
 }
 
 // The checking core: everything downstream of parse and mill. Takes an already-milled program so the editor path
